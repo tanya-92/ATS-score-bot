@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const TelegramBot = require("node-telegram-bot-api");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const pdfModule = require("pdf-parse");
 const mammoth = require("mammoth");
 const fetch = require("node-fetch");
@@ -10,6 +11,20 @@ const path = require("path");
 
 if (!process.env.BOT_TOKEN) {
     throw new Error("BOT_TOKEN is missing in .env");
+}
+
+let model = null;
+let genAIClient = null;
+const FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"];
+if (process.env.GEMINI_API_KEY) {
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    genAIClient = genAI;
+    const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+    model = genAI.getGenerativeModel({
+        model: modelName
+    });
+} else {
+    console.warn("GEMINI_API_KEY is missing. AI suggestions and AI resume rewrite are disabled.");
 }
 
 const LOCK_FILE = path.join(os.tmpdir(), "ats_telegram_bot.lock");
@@ -26,10 +41,15 @@ bot.on("polling_error", (err) => {
 });
 
 let userData = {};
+let aiUsage = {};
 const SCORE_THRESHOLD = 65;
 const STOP_WORDS = new Set([
     "and", "the", "for", "with", "you", "your", "from", "that", "this", "have", "will", "are", "our", "job", "role",
     "ability", "skills", "years", "year", "experience", "candidate", "work", "team", "using", "must", "should", "can"
+]);
+const BAD_KEYWORDS = new Set([
+    "eligibility", "students", "student", "university", "college", "undergraduate", "postgraduate", "recognized", "open", "any",
+    "front", "development", "creating", "visually", "appealing", "interactive", "responsive", "interfaces", "like", "server"
 ]);
 
 bot.onText(/\/start/, (msg) => {
@@ -91,7 +111,7 @@ bot.on("document", async (msg) => {
     }
 });
 
-bot.on("message", (msg) => {
+bot.on("message", async (msg) => {
     const chatId = msg.chat.id;
 
     if (!msg.text || msg.text.startsWith("/")) return;
@@ -102,22 +122,111 @@ bot.on("message", (msg) => {
     }
 
     const jd = msg.text;
+    if (jd.trim().length < 30) {
+        bot.sendMessage(chatId, "⚠️ Please provide a detailed job description (at least 30 characters).");
+        return;
+    }
+
     const resume = userData[chatId].resume;
 
-    const ats = evaluateATS(resume, jd);
-    const suggestionText = getRecommendations(ats.score, ats.missingKeywords);
+    let ats;
+    let usedAI = false;
 
-    bot.sendMessage(
+    if (model) {
+        const usage = aiUsage[chatId];
+        const today = new Date().toDateString();
+        if (!usage || usage.date !== today) {
+            aiUsage[chatId] = { count: 0, date: today };
+        }
+
+        if (aiUsage[chatId].count < 3) {
+            try {
+                ats = await generateAIAtsScore(resume, jd);
+                usedAI = true;
+                aiUsage[chatId].count++;
+            } catch (err) {
+                console.error("AI ATS Scoring failed:", err.message || err);
+                usedAI = false;
+            }
+        }
+    }
+
+    if (!usedAI) {
+        ats = evaluateATS(resume, jd);
+    }
+
+    const suggestionText = getRecommendations(ats.score, ats.missingKeywords);
+    const missingStyled = ats.missingKeywords.slice(0, 12).map((k) => `- ${k} ❌`).join("\n") || "None";
+
+    await bot.sendMessage(
         chatId,
         `📊 ATS Score: ${ats.score}/100\n\n` +
+        `📌 Score Breakdown\n` +
+        `Skills Match: ${ats.breakdown.skillsMatch}%\n` +
+        `Experience Match: ${ats.breakdown.experienceMatch}%\n` +
+        `Keywords Match: ${ats.breakdown.keywordsMatch}%\n\n` +
         `✅ Matched Keywords: ${ats.matchedKeywords.length}\n` +
-        `❗ Missing Keywords:\n${ats.missingKeywords.slice(0, 12).join(", ") || "None"}\n\n` +
+        `❗ Missing Keywords:\n${missingStyled}\n\n` +
         suggestionText
     );
 
-    sendImprovedCvFiles(chatId, resume, jd, ats).catch((err) => {
-        console.error("CV generation error:", err.message);
-    });
+    const top3 = ats.missingKeywords.slice(0, 3);
+    await bot.sendMessage(
+        chatId,
+        `🔥 Top Fixes:\n` +
+        `1. Add ${top3[0] || "relevant skills"}\n` +
+        `2. Improve ${top3[1] || "project bullets"}\n` +
+        `3. Highlight ${top3[2] || "tools used"}`
+    );
+
+    try {
+        if (!model) {
+            await sendImprovedCvFiles(chatId, resume, jd, ats);
+            delete userData[chatId];
+            return;
+        }
+
+        if (aiUsage[chatId].count >= 3 && !usedAI) {
+            await bot.sendMessage(chatId, "⚠️ AI limit reached (3 uses/day).");
+            await sendImprovedCvFiles(chatId, resume, jd, ats);
+            delete userData[chatId];
+            return;
+        }
+
+        if (!usedAI) {
+            await sendImprovedCvFiles(chatId, resume, jd, ats);
+            delete userData[chatId];
+            return;
+        }
+
+        const aiSuggestions = await generateAISuggestions(
+            resume,
+            jd,
+            ats.missingKeywords
+        );
+
+        await bot.sendMessage(
+            chatId,
+            `🤖 AI Suggestions:\n\n${aiSuggestions}`
+        );
+
+        const aiResume = await generateAIResume(resume, jd);
+
+        const filePath = path.join(os.tmpdir(), `ai_cv_${chatId}_${Date.now()}.txt`);
+        fs.writeFileSync(filePath, aiResume, "utf-8");
+
+        await bot.sendDocument(
+            chatId,
+            filePath,
+            { caption: "🤖 AI Optimized Resume" },
+            { filename: path.basename(filePath), contentType: "text/plain" }
+        );
+
+        fs.unlinkSync(filePath);
+    } catch (err) {
+        console.error("AI ERROR:", err.message || err);
+        await sendImprovedCvFiles(chatId, resume, jd, ats);
+    }
 
     // Reset state so user can run a new analysis cleanly.
     delete userData[chatId];
@@ -127,10 +236,20 @@ function normalizeWords(text) {
     return text
         .toLowerCase()
         .split(/[^a-z0-9+#.]+/)
-        .filter((w) => w.length > 2 && !STOP_WORDS.has(w));
+        .filter(isGoodKeyword);
+}
+
+function isGoodKeyword(word) {
+    return (
+        word.length > 3 &&
+        !/^\d+$/.test(word) &&
+        !STOP_WORDS.has(word) &&
+        !BAD_KEYWORDS.has(word)
+    );
 }
 
 function evaluateATS(resume, jd) {
+    const sections = extractResumeSections(resume);
     const resumeSet = new Set(normalizeWords(resume));
     const jdSet = new Set(normalizeWords(jd));
     const jdKeywords = [...jdSet];
@@ -139,18 +258,89 @@ function evaluateATS(resume, jd) {
         return {
             score: 0,
             matchedKeywords: [],
-            missingKeywords: []
+            missingKeywords: [],
+            breakdown: {
+                skillsMatch: 0,
+                experienceMatch: 0,
+                keywordsMatch: 0
+            }
         };
     }
 
-    const matchedKeywords = jdKeywords.filter((word) => resumeSet.has(word));
-    const missingKeywords = jdKeywords.filter((word) => !resumeSet.has(word));
+    const matchedKeywords = jdKeywords.filter((word) => isMatch(word, resumeSet));
+    const missingKeywords = jdKeywords.filter((word) => !isMatch(word, resumeSet));
+
+    const skillsWords = new Set(normalizeWords(sections.skills));
+    const experienceWords = new Set(normalizeWords(`${sections.experience}\n${sections.projects}`));
+    const skillsMatched = jdKeywords.filter((word) => isMatch(word, skillsWords)).length;
+    const experienceMatched = jdKeywords.filter((word) => isMatch(word, experienceWords)).length;
+
+    const keywordsMatch = Math.round((matchedKeywords.length / jdKeywords.length) * 100);
+    const skillsMatch = Math.round((skillsMatched / jdKeywords.length) * 100);
+    const experienceMatch = Math.round((experienceMatched / jdKeywords.length) * 100);
+
+    const rawScore = Math.round((keywordsMatch * 0.5) + (skillsMatch * 0.25) + (experienceMatch * 0.25));
 
     return {
-        score: Math.round((matchedKeywords.length / jdKeywords.length) * 100),
+        score: rawScore < 20 ? rawScore : Math.max(rawScore, 30),
         matchedKeywords,
-        missingKeywords
+        missingKeywords,
+        breakdown: {
+            skillsMatch,
+            experienceMatch,
+            keywordsMatch
+        }
     };
+}
+
+function isMatch(word, resumeWords) {
+    return [...resumeWords].some((rw) => rw.includes(word) || word.includes(rw));
+}
+
+function extractSkills(text) {
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    return lines.filter((line) => /\b(skill|skills|tech stack|technologies)\b/i.test(line));
+}
+
+function extractResumeSections(text) {
+    const lines = text.split(/\r?\n/);
+    const sections = {
+        skills: extractSkills(text).join("\n"),
+        experience: "",
+        projects: ""
+    };
+
+    let current = "";
+    for (const raw of lines) {
+        const line = raw.trim();
+        const lower = line.toLowerCase();
+
+        if (/\b(skills|technical skills|tech stack|technologies)\b/.test(lower)) {
+            current = "skills";
+            continue;
+        }
+        if (/\b(experience|work experience|employment|internship)\b/.test(lower)) {
+            current = "experience";
+            continue;
+        }
+        if (/\b(projects|project experience|academic projects)\b/.test(lower)) {
+            current = "projects";
+            continue;
+        }
+
+        if (current && line) {
+            sections[current] += `${line}\n`;
+        }
+    }
+
+    if (!sections.experience) {
+        sections.experience = text;
+    }
+    if (!sections.projects) {
+        sections.projects = text;
+    }
+
+    return sections;
 }
 
 function getRecommendations(score, missingKeywords) {
@@ -169,26 +359,203 @@ function getRecommendations(score, missingKeywords) {
 }
 
 function buildImprovedCvText(resume, jd, ats) {
-    const improvements = [
-        "Improved ATS CV Draft",
-        "",
-        "Summary:",
-        "Result-driven candidate aligned with the role requirements. Add quantifiable outcomes per project/experience.",
-        "",
-        "Top Missing JD Keywords:",
-        ...(ats.missingKeywords.slice(0, 15).length ? ats.missingKeywords.slice(0, 15) : ["No major missing keyword found"]),
-        "",
-        "Bullet Rewrite Template:",
-        "- Action verb + task + tool/skill + measurable impact (%, $, time saved, users impacted)",
-        "",
-        "JD Snapshot:",
-        jd.slice(0, 1200),
-        "",
-        "Original Resume Snapshot:",
-        resume.slice(0, 1800)
-    ];
+    return rewriteResumeDraft(resume, jd, ats);
+}
 
-    return improvements.join("\n");
+async function generateAIAtsScore(resume, jd) {
+    const trimmedResume = resume.slice(0, 4000);
+    const trimmedJD = jd.slice(0, 2000);
+
+    const prompt = `
+You are an ATS resume expert. Evaluate the following resume against the job description.
+Return a RAW JSON object representing the ATS score and keyword match data.
+DO NOT use markdown formatting (no \`\`\`json). Just return the raw JSON string.
+The JSON must have EXACTLY this structure:
+{
+  "score": <number between 0 and 100>,
+  "matchedKeywords": [<string array of up to 10 matched skills>],
+  "missingKeywords": [<string array of up to 10 missing skills from JD>],
+  "breakdown": {
+    "skillsMatch": <number 0-100>,
+    "experienceMatch": <number 0-100>,
+    "keywordsMatch": <number 0-100>
+  }
+}
+
+Resume:
+${trimmedResume}
+
+Job Description:
+${trimmedJD}
+`;
+    const response = await generateWithFallback(prompt);
+    let text = response.text().trim();
+    if (text.startsWith("\`\`\`json")) text = text.replace(/^\`\`\`json[\s\n]*/i, "");
+    if (text.startsWith("\`\`\`")) text = text.replace(/^\`\`\`[\s\n]*/, "");
+    if (text.endsWith("\`\`\`")) text = text.replace(/[\s\n]*\`\`\`$/i, "");
+    const parsed = JSON.parse(text);
+    if (typeof parsed.score !== "number") throw new Error("Invalid ATS JSON");
+    return parsed;
+}
+
+async function generateAISuggestions(resume, jd, missingKeywords) {
+    const trimmedResume = resume.slice(0, 4000);
+    const trimmedJD = jd.slice(0, 2000);
+
+    const prompt = `
+You are an ATS resume expert.
+
+Analyze the resume vs job description and give concise actionable advice:
+1. Key improvements
+2. Missing skills to add
+3. Bullet improvement suggestions
+
+Missing Keywords:
+${missingKeywords.join(", ")}
+
+Resume:
+${trimmedResume}
+
+Job Description:
+${trimmedJD}
+
+CRITICAL RULES:
+- Use PLAIN TEXT ONLY. DO NOT use any markdown characters (like **, _, ###, #).
+- Use clear visual emojis (like 📌, 💡, ✅, 🛠) for bullet points and section headers.
+- Keep the response brief, highly practical, and strictly under 150 words.
+`;
+
+    const response = await generateWithFallback(prompt);
+
+    let text = response.text() || "";
+    // Clean up any rogue markdown just in case the AI hallucinates it
+    text = text.replace(/[*_#`~]+/g, "");
+
+    return text.trim();
+}
+
+async function generateAIResume(resume, jd) {
+    const trimmedResume = resume.slice(0, 4000);
+    const trimmedJD = jd.slice(0, 2000);
+
+    const prompt = `
+Rewrite this resume to match the job description.
+
+Rules:
+- ATS optimized
+- Strong action verbs
+- Add relevant skills
+- Keep professional formatting
+
+Resume:
+${trimmedResume}
+
+Job Description:
+${trimmedJD}
+`;
+
+    const response = await generateWithFallback(prompt);
+
+    return response.text();
+}
+
+async function generateWithFallback(prompt) {
+    if (model) {
+        try {
+            const result = await model.generateContent(prompt);
+            return result.response;
+        } catch (err) {
+            const message = String(err.message || err);
+            if (!message.includes("404") || !genAIClient) {
+                throw err;
+            }
+        }
+    }
+
+    if (!genAIClient) {
+        throw new Error("Gemini client is not initialized.");
+    }
+
+    for (const modelName of FALLBACK_MODELS) {
+        try {
+            const fallback = genAIClient.getGenerativeModel({ model: modelName });
+            const result = await fallback.generateContent(prompt);
+            model = fallback;
+            return result.response;
+        } catch (_) {
+            // Try next model.
+        }
+    }
+
+    throw new Error("No compatible Gemini model available for generateContent.");
+}
+
+function rewriteResumeDraft(resume, jd, ats) {
+    const sections = extractResumeSections(resume);
+    const lines = resume
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+    const possibleName = lines[0] && lines[0].length < 60 ? lines[0] : "Candidate Name";
+    const roleKeywords = [...ats.matchedKeywords, ...ats.missingKeywords].slice(0, 10);
+    const topSkills = roleKeywords.slice(0, 8);
+
+    const bulletsFromResume = [...sections.experience.split(/\r?\n/), ...sections.projects.split(/\r?\n/)]
+        .filter((line) => /^[\-•*]/.test(line) || /\b(developed|built|managed|designed|implemented|created|led)\b/i.test(line))
+        .slice(0, 8);
+
+    const fallbackBullets = resume
+        .split(/[.!?]\s+/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 35)
+        .slice(0, 6)
+        .map((s) => `- ${s}`);
+
+    const sourceBullets = bulletsFromResume.length ? bulletsFromResume : fallbackBullets;
+    const actionVerbs = ["Delivered", "Engineered", "Optimized", "Implemented", "Collaborated", "Automated", "Improved", "Designed"];
+
+    const rewrittenBullets = sourceBullets.slice(0, 6).map((bullet, idx) => {
+        const clean = bullet.replace(/^[\-•*]\s*/, "").trim();
+        const k1 = roleKeywords[idx % Math.max(roleKeywords.length, 1)] || "role-specific tools";
+        const k2 = roleKeywords[(idx + 1) % Math.max(roleKeywords.length, 1)] || "business requirements";
+        const verb = actionVerbs[idx % actionVerbs.length];
+        const low = clean.charAt(0).toLowerCase() + clean.slice(1);
+        const templates = [
+            `${verb} ${low} resulting in improved efficiency.`,
+            `${verb} ${low} using ${k1}, enhancing performance.`,
+            `${verb} ${low}, contributing to team success with focus on ${k2}.`
+        ];
+        return `- ${templates[idx % templates.length]}`;
+    });
+
+    const jdSnapshot = jd
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, 6)
+        .join("\n");
+
+    return [
+        `${possibleName}`,
+        "Email | Phone | LinkedIn | GitHub",
+        "",
+        "PROFESSIONAL SUMMARY",
+        `Results-oriented professional with hands-on experience aligned to ${roleKeywords.slice(0, 4).join(", ") || "target role requirements"}. Demonstrated ability to execute projects, collaborate with teams, and deliver measurable outcomes in fast-paced environments.`,
+        "",
+        "CORE SKILLS",
+        topSkills.length ? topSkills.join(" | ") : "Project Execution | Communication | Problem Solving | Time Management",
+        "",
+        "PROFESSIONAL EXPERIENCE",
+        ...rewrittenBullets,
+        "",
+        "ATS ALIGNMENT NOTES",
+        `Current ATS score: ${ats.score}/100`,
+        `High-priority missing keywords: ${ats.missingKeywords.slice(0, 10).join(", ") || "None"}`,
+        "",
+        "TARGET JD SNAPSHOT",
+        jdSnapshot || "No JD snapshot available"
+    ].join("\n");
 }
 
 async function sendImprovedCvFiles(chatId, resume, jd, ats) {
@@ -200,13 +567,29 @@ async function sendImprovedCvFiles(chatId, resume, jd, ats) {
     fs.writeFileSync(txtPath, content, "utf-8");
     fs.writeFileSync(mdPath, `# Improved CV Draft\n\n${content}`, "utf-8");
 
-    await bot.sendDocument(chatId, txtPath, {
-        caption: "📥 Download improved CV (TXT format)"
-    });
+    await bot.sendDocument(
+        chatId,
+        txtPath,
+        {
+            caption: "📥 Download improved CV (TXT format)"
+        },
+        {
+            filename: path.basename(txtPath),
+            contentType: "text/plain"
+        }
+    );
 
-    await bot.sendDocument(chatId, mdPath, {
-        caption: "📥 Download improved CV (Markdown format)"
-    });
+    await bot.sendDocument(
+        chatId,
+        mdPath,
+        {
+            caption: "📥 Download improved CV (Markdown format)"
+        },
+        {
+            filename: path.basename(mdPath),
+            contentType: "text/plain"
+        }
+    );
 
     fs.unlinkSync(txtPath);
     fs.unlinkSync(mdPath);
