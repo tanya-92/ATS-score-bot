@@ -116,13 +116,34 @@ bot.on("message", async (msg) => {
 
     if (!msg.text || msg.text.startsWith("/")) return;
 
+    const textMsg = msg.text.trim();
+    const textLen = textMsg.length;
+
+    const isConversational = textLen < 150 && (textLen < 50 || /^(hi|hello|hey|can you|how|what|why|help|thanks|thank you)\b/i.test(textMsg) || textMsg.endsWith("?"));
+
+    if (isConversational) {
+        if (model) {
+            try {
+                const prompt = `You are a helpful ATS Resume Assistant Bot. The user sent a conversational message: "${textMsg}". ` +
+                    (userData[chatId]?.resume
+                        ? `The user's current uploaded resume is provided below. Reply conversationally, keeping your answer short.\nResume: ${userData[chatId].resume.slice(0, 1500)}`
+                        : "Remind them they can start by uploading a PDF/DOCX/TXT resume.");
+                const fb = await generateWithFallback(prompt);
+                bot.sendMessage(chatId, fb.text());
+                return;
+            } catch (e) {
+                console.error("Chat failure", e);
+            }
+        }
+    }
+
     if (!userData[chatId]?.resume) {
-        bot.sendMessage(chatId, "⚠️ Please upload resume first.");
+        bot.sendMessage(chatId, "⚠️ Please upload your resume first (PDF/DOCX/TXT) before ATS processing.");
         return;
     }
 
-    const jd = msg.text;
-    if (jd.trim().length < 30) {
+    const jd = textMsg;
+    if (jd.length < 30) {
         bot.sendMessage(chatId, "⚠️ Please provide a detailed job description (at least 30 characters).");
         return;
     }
@@ -218,9 +239,42 @@ bot.on("message", async (msg) => {
         await bot.sendDocument(
             chatId,
             filePath,
-            { caption: "🤖 AI Optimized Resume" },
+            { caption: "🤖 AI Optimized Resume (Text)" },
             { filename: path.basename(filePath), contentType: "text/plain" }
         );
+
+        const util = require("util");
+        const exec = util.promisify(require("child_process").exec);
+
+        try {
+            // General format
+            const { stdout: out1 } = await exec(`python update_docx.py "cv/generalcv.docx" "${filePath}"`);
+            const docPath1 = out1.trim().split("\\n").pop();
+            if (fs.existsSync(docPath1)) {
+                await bot.sendDocument(
+                    chatId,
+                    docPath1,
+                    { caption: "📝 General CV (ATS Optimized)" },
+                    { filename: path.basename(docPath1), contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+                );
+                fs.unlinkSync(docPath1);
+            }
+
+            // Specialized format
+            const { stdout: out2 } = await exec(`python update_docx.py "cv/specialized.docx" "${filePath}"`);
+            const docPath2 = out2.trim().split("\\n").pop();
+            if (fs.existsSync(docPath2)) {
+                await bot.sendDocument(
+                    chatId,
+                    docPath2,
+                    { caption: "💼 Specialized CV (ATS Optimized)" },
+                    { filename: path.basename(docPath2), contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+                );
+                fs.unlinkSync(docPath2);
+            }
+        } catch (docxErr) {
+            console.error("DOCX Gen Error:", docxErr.message || docxErr);
+        }
 
         fs.unlinkSync(filePath);
     } catch (err) {
